@@ -1,4 +1,4 @@
-Bare-minimum C midterm demo starter
+C midterm demo starter
 
 What it covers for the March 23 midterm demo:
 - multithreaded tracker server
