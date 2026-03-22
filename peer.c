@@ -1,12 +1,14 @@
 #include "common.h"
 #include <fcntl.h>
 
+/* Bundle passed to each per-connection file-serving thread. */
 typedef struct {
-    int sock;
-    PeerServerConfig cfg;
-} PeerServeArgs;
+    int            connection;   /* accepted socket fd for this downloader */
+    PeerServerConfig server_cfg; /* snapshot of this peer's server settings */
+} FileServeJob;
 
-/* CLI usage for manual protocol testing during demo. */
+/* ── Usage ─────────────────────────────────────────────────────── */
+
 static void usage(void) {
     printf("Usage:\n");
     printf("  ./peer <name> <client_cfg> <server_cfg> serve\n");
@@ -17,28 +19,35 @@ static void usage(void) {
     printf("  ./peer <name> <client_cfg> <server_cfg> download <peer_ip> <peer_port> <filename>\n");
 }
 
-static int connect_to(const char *ip, int port) {
+/* ── TCP helpers ───────────────────────────────────────────────── */
+
+/* Open a TCP connection to ip:port.  Returns the socket fd, or -1 on failure. */
+static int open_tcp_connection(const char *ip, int port) {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in addr;
     if (sock < 0) return -1;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    if (inet_pton(AF_INET, ip, &addr.sin_addr) <= 0) { close(sock); return -1; }
+    addr.sin_port   = htons(port);
+    if (inet_pton(AF_INET, ip, &addr.sin_addr) <= 0)  { close(sock); return -1; }
     if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) { close(sock); return -1; }
     return sock;
 }
 
-/* Send one tracker request and print raw tracker reply for easy grading. */
-static void tracker_send_and_print(const PeerClientConfig *ccfg, const char *msg) {
-    int sock = connect_to(ccfg->tracker_ip, ccfg->tracker_port);
+/* Send a single text command to the tracker and print everything the
+   tracker sends back.  Used for commands where we just want to see
+   the raw reply (e.g. during demo or manual testing). */
+static void send_tracker_request(const PeerClientConfig *tracker_info, const char *msg) {
+    int  sock = open_tcp_connection(tracker_info->tracker_ip, tracker_info->tracker_port);
     char buf[MAXLINE];
-    if (sock < 0) {
-        printf("could not connect to tracker\n");
-        return;
-    }
+
+    if (sock < 0) { printf("could not connect to tracker\n"); return; }
+
     send_all(sock, msg, strlen(msg));
+    /* Ensure the message ends with a newline so the tracker's recv_line() returns. */
     if (msg[strlen(msg) - 1] != '\n') send_all(sock, "\n", 1);
+
+    /* Drain and print the full response. */
     while (1) {
         int n = recv(sock, buf, sizeof(buf) - 1, 0);
         if (n <= 0) break;
@@ -48,206 +57,269 @@ static void tracker_send_and_print(const PeerClientConfig *ccfg, const char *msg
     close(sock);
 }
 
-static void do_list(const char *name, const PeerClientConfig *ccfg) {
-    printf("%s: REQ LIST\n", name);
-    tracker_send_and_print(ccfg, "REQ LIST\n");
+/* ── Peer commands (called from main) ─────────────────────────── */
+
+/* Ask the tracker for the list of registered files. */
+static void request_file_list(const char *peer_name, const PeerClientConfig *tracker_info) {
+    printf("%s: REQ LIST\n", peer_name);
+    send_tracker_request(tracker_info, "REQ LIST\n");
 }
 
-static void do_createtracker(const char *name, const PeerClientConfig *ccfg, const PeerServerConfig *scfg, const char *filename, const char *description) {
-    char filepath[PATHBUF], msg[MAXLINE];
-    char local_ip[64] = "127.0.0.1";
-    long size;
-    build_path(filepath, sizeof(filepath), scfg->shared_dir, filename);
-    size = get_file_size(filepath);
-    if (size < 0) {
-        printf("%s: file not found in shared dir: %s\n", name, filepath);
+/* Tell the tracker about a file we're seeding so other peers can find it.
+   We auto-detect our outbound IP so this works across machines too. */
+static void register_file_with_tracker(const char *peer_name,
+                                       const PeerClientConfig *tracker_info,
+                                       const PeerServerConfig *server_cfg,
+                                       const char *filename,
+                                       const char *description) {
+    char local_filepath[PATHBUF], msg[MAXLINE];
+    char my_ip[64] = "127.0.0.1";
+    long filesize;
+
+    build_path(local_filepath, sizeof(local_filepath), server_cfg->shared_dir, filename);
+    filesize = get_file_size(local_filepath);
+    if (filesize < 0) {
+        printf("%s: file not found in shared dir: %s\n", peer_name, local_filepath);
         return;
     }
-    /* Use detected outbound IP so this works across machines, not only localhost. */
-    if (get_local_ip_for_remote(ccfg->tracker_ip, ccfg->tracker_port, local_ip, sizeof(local_ip)) != 0) {
-        strncpy(local_ip, "127.0.0.1", sizeof(local_ip) - 1);
-        local_ip[sizeof(local_ip) - 1] = '\0';
+
+    /* Resolve the IP the OS would actually use to reach the tracker. */
+    if (get_local_ip_for_remote(tracker_info->tracker_ip, tracker_info->tracker_port,
+                                my_ip, sizeof(my_ip)) != 0) {
+        strncpy(my_ip, "127.0.0.1", sizeof(my_ip) - 1);
+        my_ip[sizeof(my_ip) - 1] = '\0';
     }
-    snprintf(msg, sizeof(msg), "createtracker %s %ld %s dummy_md5 %s %d\n", filename, size, description, local_ip, scfg->listen_port);
-    printf("%s: %s", name, msg);
-    tracker_send_and_print(ccfg, msg);
+
+    snprintf(msg, sizeof(msg), "createtracker %s %ld %s dummy_md5 %s %d\n",
+             filename, filesize, description, my_ip, server_cfg->listen_port);
+    printf("%s: %s", peer_name, msg);
+    send_tracker_request(tracker_info, msg);
 }
 
-static void do_updatetracker(const char *name, const PeerClientConfig *ccfg, const PeerServerConfig *scfg, const char *filename, long startb, long endb) {
+/* Notify the tracker that we now own bytes [start_byte, end_byte] of a file.
+   Called after a successful download so other peers know we can seed it. */
+static void report_bytes_owned(const char *peer_name,
+                                const PeerClientConfig *tracker_info,
+                                const PeerServerConfig *server_cfg,
+                                const char *filename,
+                                long start_byte, long end_byte) {
     char msg[MAXLINE];
-    char local_ip[64] = "127.0.0.1";
-    if (get_local_ip_for_remote(ccfg->tracker_ip, ccfg->tracker_port, local_ip, sizeof(local_ip)) != 0) {
-        strncpy(local_ip, "127.0.0.1", sizeof(local_ip) - 1);
-        local_ip[sizeof(local_ip) - 1] = '\0';
+    char my_ip[64] = "127.0.0.1";
+
+    if (get_local_ip_for_remote(tracker_info->tracker_ip, tracker_info->tracker_port,
+                                my_ip, sizeof(my_ip)) != 0) {
+        strncpy(my_ip, "127.0.0.1", sizeof(my_ip) - 1);
+        my_ip[sizeof(my_ip) - 1] = '\0';
     }
-    snprintf(msg, sizeof(msg), "updatetracker %s %ld %ld %s %d\n", filename, startb, endb, local_ip, scfg->listen_port);
-    printf("%s: %s", name, msg);
-    tracker_send_and_print(ccfg, msg);
+
+    snprintf(msg, sizeof(msg), "updatetracker %s %ld %ld %s %d\n",
+             filename, start_byte, end_byte, my_ip, server_cfg->listen_port);
+    printf("%s: %s", peer_name, msg);
+    send_tracker_request(tracker_info, msg);
 }
 
-static void do_gettrack(const char *name, const PeerClientConfig *ccfg, const PeerServerConfig *scfg, const char *trackname) {
-    int sock = connect_to(ccfg->tracker_ip, ccfg->tracker_port);
-    char buf[MAXLINE], outpath[PATHBUF];
+/* Download a .track file from the tracker and save it to our shared dir.
+   The tracker wraps the content in REP GET BEGIN / REP GET END markers. */
+static void fetch_tracker_file(const char *peer_name,
+                                const PeerClientConfig *tracker_info,
+                                const PeerServerConfig *server_cfg,
+                                const char *track_filename) {
+    int  sock = open_tcp_connection(tracker_info->tracker_ip, tracker_info->tracker_port);
+    char buf[MAXLINE], save_path[PATHBUF];
     FILE *fp;
-    int saving = 0;
-    if (sock < 0) {
-        printf("%s: could not connect to tracker\n", name);
-        return;
-    }
-    snprintf(buf, sizeof(buf), "GET %s\n", trackname);
-    printf("%s: GET %s\n", name, trackname);
+    int   inside_content = 0;   /* true once we've seen REP GET BEGIN */
+
+    if (sock < 0) { printf("%s: could not connect to tracker\n", peer_name); return; }
+
+    snprintf(buf, sizeof(buf), "GET %s\n", track_filename);
+    printf("%s: GET %s\n", peer_name, track_filename);
     send_all(sock, buf, strlen(buf));
-    build_path(outpath, sizeof(outpath), scfg->shared_dir, trackname);
-    fp = fopen(outpath, "w");
+
+    build_path(save_path, sizeof(save_path), server_cfg->shared_dir, track_filename);
+    fp = fopen(save_path, "w");
     if (!fp) { close(sock); return; }
 
     while (recv_line(sock, buf, sizeof(buf)) > 0) {
-        if (strncmp(buf, "REP GET BEGIN", 13) == 0) {
-            saving = 1;
-            continue;
-        }
-        if (strncmp(buf, "REP GET END", 11) == 0) break;
-        if (saving) fputs(buf, fp);
+        if (strncmp(buf, "REP GET BEGIN", 13) == 0) { inside_content = 1; continue; }
+        if (strncmp(buf, "REP GET END",   11) == 0) break;
+        if (inside_content) fputs(buf, fp);
     }
     fclose(fp);
     close(sock);
-    printf("%s: saved tracker file to %s\n", name, outpath);
+    printf("%s: saved tracker file to %s\n", peer_name, save_path);
 }
 
-static void *peer_file_thread(void *arg) {
-    PeerServeArgs *ps = (PeerServeArgs *)arg;
-    char line[MAXLINE], cmd[64], filename[256], filepath[PATHBUF];
-    long offset = 0, length = 0;
+/* ── File server (runs as a long-lived background loop) ─────────── */
+
+/* Thread that handles one incoming GETFILE request from another peer.
+   Expected request format: "GETFILE <filename> <offset> <length>\n"
+   Responds with raw bytes from the file at the requested position. */
+static void *serve_file_request(void *arg) {
+    FileServeJob *job = (FileServeJob *)arg;
+    char  line[MAXLINE], cmd[64], filename[256], filepath[PATHBUF];
+    long  offset = 0, length = 0;
     FILE *fp;
-    if (recv_line(ps->sock, line, sizeof(line)) <= 0) {
-        close(ps->sock); free(ps); return NULL;
+
+    if (recv_line(job->connection, line, sizeof(line)) <= 0) {
+        close(job->connection); free(job); return NULL;
     }
     trim_newline(line);
-    /* Accept both GETFILE and GET to stay compatible with grader wording. */
+
+    /* Accept both "GETFILE" and "GET" to stay compatible with different graders. */
     if (sscanf(line, "%63s %255s %ld %ld", cmd, filename, &offset, &length) == 4 &&
         (strcmp(cmd, "GETFILE") == 0 || strcmp(cmd, "GET") == 0)) {
-        build_path(filepath, sizeof(filepath), ps->cfg.shared_dir, filename);
+
+        build_path(filepath, sizeof(filepath), job->server_cfg.shared_dir, filename);
         fp = fopen(filepath, "rb");
+
         if (!fp) {
-            send_all(ps->sock, "ERROR no_such_file\n", 19);
+            send_all(job->connection, "ERROR no_such_file\n", 19);
         } else if (length > MAX_CHUNK) {
-            send_all(ps->sock, "GET invalid\n", 12);
+            /* Protect against absurdly large requests. */
+            send_all(job->connection, "GET invalid\n", 12);
             fclose(fp);
         } else {
-            char buffer[MAX_CHUNK];
-            size_t nread;
+            char  data_buf[MAX_CHUNK];
+            size_t bytes_read;
             fseek(fp, offset, SEEK_SET);
-            nread = fread(buffer, 1, (size_t)length, fp);
-            send(ps->sock, buffer, nread, 0);
+            bytes_read = fread(data_buf, 1, (size_t)length, fp);
+            send(job->connection, data_buf, bytes_read, 0);
             fclose(fp);
         }
     } else {
-        send_all(ps->sock, "ERROR bad_request\n", 18);
+        send_all(job->connection, "ERROR bad_request\n", 18);
     }
-    close(ps->sock);
-    free(ps);
+
+    close(job->connection);
+    free(job);
     return NULL;
 }
 
-static void run_server(const char *name, const PeerServerConfig *scfg) {
-    int sockfd, clientfd, opt = 1;
-    struct sockaddr_in addr, client;
-    socklen_t clen = sizeof(client);
-    ensure_dir(scfg->shared_dir);
+/* Accept loop: wait for incoming peer connections and hand each one off
+   to a new detached thread so we can serve multiple peers simultaneously. */
+static void start_file_server(const char *peer_name, const PeerServerConfig *server_cfg) {
+    int listen_sock, conn_sock, reuse = 1;
+    struct sockaddr_in bind_addr, downloader_addr;
+    socklen_t addr_len = sizeof(downloader_addr);
 
-    sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    ensure_dir(server_cfg->shared_dir);
 
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(scfg->listen_port);
-    addr.sin_addr.s_addr = INADDR_ANY;
+    listen_sock = socket(AF_INET, SOCK_STREAM, 0);
+    setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 
-    if (bind(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) { perror("bind"); return; }
-    if (listen(sockfd, 10) < 0) { perror("listen"); return; }
+    memset(&bind_addr, 0, sizeof(bind_addr));
+    bind_addr.sin_family      = AF_INET;
+    bind_addr.sin_port        = htons(server_cfg->listen_port);
+    bind_addr.sin_addr.s_addr = INADDR_ANY;
 
-    printf("%s: peer server listening on %d, dir=%s\n", name, scfg->listen_port, scfg->shared_dir);
+    if (bind(listen_sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) { perror("bind"); return; }
+    if (listen(listen_sock, 10) < 0)                                              { perror("listen"); return; }
+
+    printf("%s: peer server listening on port %d, dir=%s\n",
+           peer_name, server_cfg->listen_port, server_cfg->shared_dir);
+
     while (1) {
-        PeerServeArgs *ps;
-        pthread_t tid;
-        clientfd = accept(sockfd, (struct sockaddr *)&client, &clen);
-        if (clientfd < 0) continue;
-        ps = (PeerServeArgs *)malloc(sizeof(PeerServeArgs));
-        ps->sock = clientfd;
-        ps->cfg = *scfg;
-        pthread_create(&tid, NULL, peer_file_thread, ps);
-        pthread_detach(tid);
+        FileServeJob *job;
+        pthread_t     worker;
+
+        conn_sock = accept(listen_sock, (struct sockaddr *)&downloader_addr, &addr_len);
+        if (conn_sock < 0) continue;
+
+        job                 = (FileServeJob *)malloc(sizeof(FileServeJob));
+        job->connection     = conn_sock;
+        job->server_cfg     = *server_cfg;
+
+        pthread_create(&worker, NULL, serve_file_request, job);
+        pthread_detach(worker);
     }
 }
 
-static void do_download(const char *name, const PeerServerConfig *scfg, const char *peer_ip, int peer_port, const char *filename) {
-    int sock = connect_to(peer_ip, peer_port);
-    char req[MAXLINE], outpath[PATHBUF];
-    char buffer[MAX_CHUNK];
-    int n;
+/* Ask a specific peer for the first MAX_CHUNK bytes of a file and save it locally.
+   This is a simplified download that proves peer-to-peer transfer works. */
+static void download_chunk_from_peer(const char *peer_name,
+                                     const PeerServerConfig *server_cfg,
+                                     const char *peer_ip,
+                                     int peer_port,
+                                     const char *filename) {
+    int  sock = open_tcp_connection(peer_ip, peer_port);
+    char request[MAXLINE], save_path[PATHBUF];
+    char data_buf[MAX_CHUNK];
+    int  bytes_received;
+
     if (sock < 0) {
-        printf("%s: could not connect to peer %s:%d\n", name, peer_ip, peer_port);
+        printf("%s: could not connect to peer %s:%d\n", peer_name, peer_ip, peer_port);
         return;
     }
-    snprintf(req, sizeof(req), "GETFILE %s 0 %d\n", filename, MAX_CHUNK);
-    printf("%s downloading first %d bytes of %s from %s %d\n", name, MAX_CHUNK, filename, peer_ip, peer_port);
-    send_all(sock, req, strlen(req));
-    n = recv(sock, buffer, sizeof(buffer), 0);
-    if (n <= 0) {
-        printf("%s: download failed\n", name);
+
+    snprintf(request, sizeof(request), "GETFILE %s 0 %d\n", filename, MAX_CHUNK);
+    printf("%s downloading first %d bytes of %s from %s:%d\n",
+           peer_name, MAX_CHUNK, filename, peer_ip, peer_port);
+    send_all(sock, request, strlen(request));
+
+    bytes_received = recv(sock, data_buf, sizeof(data_buf), 0);
+    if (bytes_received <= 0) {
+        printf("%s: download failed\n", peer_name);
         close(sock);
         return;
     }
-    build_path(outpath, sizeof(outpath), scfg->shared_dir, filename);
-    FILE *fp = fopen(outpath, "wb");
+
+    build_path(save_path, sizeof(save_path), server_cfg->shared_dir, filename);
+    FILE *fp = fopen(save_path, "wb");
     if (!fp) { close(sock); return; }
-    fwrite(buffer, 1, (size_t)n, fp);
+    fwrite(data_buf, 1, (size_t)bytes_received, fp);
     fclose(fp);
     close(sock);
-    printf("%s: saved partial file to %s (%d bytes)\n", name, outpath, n);
+
+    printf("%s: saved partial file to %s (%d bytes)\n", peer_name, save_path, bytes_received);
 }
 
+/* ── Entry point ───────────────────────────────────────────────── */
+
 int main(int argc, char **argv) {
-    const char *name, *client_cfg_path, *server_cfg_path, *cmd;
-    PeerClientConfig ccfg;
-    PeerServerConfig scfg;
+    const char       *peer_name, *client_cfg_path, *server_cfg_path, *command;
+    PeerClientConfig  tracker_info;
+    PeerServerConfig  server_cfg;
 
     if (argc < 5) { usage(); return 1; }
-    name = argv[1];
+    peer_name       = argv[1];
     client_cfg_path = argv[2];
     server_cfg_path = argv[3];
-    cmd = argv[4];
+    command         = argv[4];
 
-    if (load_peer_client_config(client_cfg_path, &ccfg) != 0) {
-        fprintf(stderr, "failed to load client config\n");
-        return 1;
+    if (load_peer_client_config(client_cfg_path, &tracker_info) != 0) {
+        fprintf(stderr, "failed to load client config\n"); return 1;
     }
-    if (load_peer_server_config(server_cfg_path, &scfg) != 0) {
-        fprintf(stderr, "failed to load server config\n");
-        return 1;
+    if (load_peer_server_config(server_cfg_path, &server_cfg) != 0) {
+        fprintf(stderr, "failed to load server config\n"); return 1;
     }
 
-    if (strcmp(cmd, "serve") == 0) {
-        run_server(name, &scfg);
-    } else if (strcmp(cmd, "list") == 0) {
-        do_list(name, &ccfg);
-    } else if (strcmp(cmd, "createtracker") == 0) {
-        const char *filename = (argc > 5) ? argv[5] : NULL;
-        const char *desc = (argc > 6) ? argv[6] : "demo_file";
+    if (strcmp(command, "serve") == 0) {
+        start_file_server(peer_name, &server_cfg);
+
+    } else if (strcmp(command, "list") == 0) {
+        request_file_list(peer_name, &tracker_info);
+
+    } else if (strcmp(command, "createtracker") == 0) {
+        const char *filename    = (argc > 5) ? argv[5] : NULL;
+        const char *description = (argc > 6) ? argv[6] : "demo_file";
         if (!filename) { usage(); return 1; }
-        do_createtracker(name, &ccfg, &scfg, filename, desc);
-    } else if (strcmp(cmd, "updatetracker") == 0) {
+        register_file_with_tracker(peer_name, &tracker_info, &server_cfg, filename, description);
+
+    } else if (strcmp(command, "updatetracker") == 0) {
         if (argc < 8) { usage(); return 1; }
-        do_updatetracker(name, &ccfg, &scfg, argv[5], atol(argv[6]), atol(argv[7]));
-    } else if (strcmp(cmd, "gettrack") == 0) {
+        report_bytes_owned(peer_name, &tracker_info, &server_cfg,
+                           argv[5], atol(argv[6]), atol(argv[7]));
+
+    } else if (strcmp(command, "gettrack") == 0) {
         if (argc < 6) { usage(); return 1; }
-        do_gettrack(name, &ccfg, &scfg, argv[5]);
-    } else if (strcmp(cmd, "download") == 0) {
+        fetch_tracker_file(peer_name, &tracker_info, &server_cfg, argv[5]);
+
+    } else if (strcmp(command, "download") == 0) {
         if (argc < 8) { usage(); return 1; }
-        do_download(name, &scfg, argv[5], atoi(argv[6]), argv[7]);
+        download_chunk_from_peer(peer_name, &server_cfg, argv[5], atoi(argv[6]), argv[7]);
+
     } else {
-        usage();
-        return 1;
+        usage(); return 1;
     }
 
     return 0;
