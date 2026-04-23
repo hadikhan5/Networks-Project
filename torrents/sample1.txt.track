@@ -1,7 +1,0 @@
-Filename: sample1.txt
-Filesize: 2850
-Description: sample_file
-MD5: dummy_md5
-#list of peers follows next
-127.0.0.1:5001:0:2849:1774150729
-127.0.0.1:5002:0:1023:1774150729
